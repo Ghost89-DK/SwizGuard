@@ -55,7 +55,7 @@
                 "vnext": [
                     {
                         "address": "YOUR-SERVER-IP",
-                        "port": 443,
+                        "port": 449,
                         "users": [
                             {
                                 "id": "YOUR-UUID-HERE",
