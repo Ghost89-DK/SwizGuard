@@ -1,0 +1,447 @@
+# SwizGuard Troubleshooting
+
+Every weird issue I hit during development, with the actual fix. Roughly grouped by where in the stack the problem lives.
+
+## Installation issues
+
+### `unzip: command not found` during setup
+
+Some minimal VPS images don't ship with unzip. The current setup script installs it automatically, but if you're on an older deployment or something stripped:
+
+```bash
+sudo apt install -y unzip
+sudo ./swizguard setup
+```
+
+### `xray x25519` returns "Password (PublicKey)" instead of "PublicKey"
+
+Xray v26.x changed the output format of the key generation command. SwizGuard's setup script handles both formats now, but if you're installing manually or hit this somehow, the new output looks like:
+
+```
+PrivateKey: <base64-encoded 32-byte private key>
+Password (PublicKey): <base64-encoded 32-byte public key>
+Hash32: <32-byte hash, not used directly>
+```
+
+Both fields exist. The "Password (PublicKey)" line IS the public key — Xray now frames it as a "password" because clients paste it as an auth credential. Don't get confused by the renamed field.
+
+### Setup script hangs during systemd enable
+
+Usually a stale systemd state or weird permissions on the unit files. Check:
+
+```bash
+sudo systemctl status xray
+sudo systemctl status wg-quick@wg1
+```
+
+If something looks stuck, `sudo systemctl daemon-reload` and retry.
+
+## REALITY and connection issues
+
+### "REALITY handshake failed" or "not a valid supported TLS connection"
+
+**Clock skew is the #1 cause.** REALITY requires the client and server clocks to be within 30 seconds of each other. Mysterious failures with no other signal? Almost always a time issue.
+
+Server:
+```bash
+timedatectl set-ntp true
+```
+
+macOS: System Settings → General → Date & Time → Set Automatically.
+
+iOS: Settings → General → Date & Time → Set Automatically.
+
+Linux:
+```bash
+sudo timedatectl set-ntp true
+```
+
+Verify with:
+```bash
+date -u  # compare client and server output
+```
+
+### "unexpected EOF" when connecting
+
+REALITY public/private key mismatch. The client's `publicKey` doesn't match what `xray x25519` derives from the server's `privateKey`.
+
+Easiest fix:
+```bash
+sudo ./swizguard regen <client-name>
+```
+
+Then re-deploy the fresh config to the device.
+
+### "flow mismatch" — some clients work, others don't
+
+Vision flow has to be enabled on BOTH sides. If your server has `"flow": "xtls-rprx-vision"` but a client config has `"flow": ""`, the handshake fails.
+
+This happens if:
+- You upgraded the server to Vision but didn't regen one of the clients
+- You're using an old VLESS share link from before the Vision upgrade
+
+Fix:
+```bash
+sudo ./swizguard regen <client-name>
+```
+
+Then redeploy. The new configs will have matching flow values.
+
+## sing-box and iPhone issues
+
+### `unknown field "domain_resolver"` in sing-box
+
+Your SFI is running an older sing-box core (pre-1.11 on endpoints). SwizGuard's current config doesn't include this field at all, so if you're hitting this, you have an older generated config. Regen and redeploy:
+
+```bash
+sudo ./swizguard regen iphone
+```
+
+### "connection refused 127.0.0.1:53884" or similar
+
+This is Hiddify's internal sing-box backend crashing, NOT a SwizGuard issue. Hiddify sometimes fails to start its internal process. Fix:
+
+1. Force-quit Hiddify
+2. Reboot the iPhone
+3. Reopen Hiddify
+
+Or — better — switch to SFI. It's more stable for chained configs and is the recommended mobile client for SwizGuard's full chain.
+
+### SFI shows "connected" but no internet on iPhone
+
+A few possibilities to check in order:
+
+**DNS issue:** open Safari and try `1.1.1.1` (raw IP, not a domain). If that loads but domain names don't, DNS isn't going through the tunnel. SwizGuard's generated sing-box config includes a `dns` block that should handle this — make sure you imported the SwizGuard config and not something custom.
+
+**IPv6 leak:** if your VPS doesn't have public IPv6 working, apps that try IPv6 will fail. They should fall back to IPv4 automatically. If Safari hangs for 10+ seconds before loading, that's IPv6 timing out then retrying over v4. Fix: disable IPv6 on your iPhone (Settings → Wi-Fi → IP → Configure IP → IPv4 only), or get a VPS with proper IPv6 support.
+
+**Wrong config imported:** double check you imported `singbox-client.json`, not `xray-client.json`. Delete the profile in SFI and re-import the right one.
+
+### Background apps show "connection failed" errors in SFI logs
+
+This is normal. iOS apps constantly try to reach various Apple services in the background — Apple Push, iMessage, iCloud, app analytics. Some of those services use IPv6-only endpoints that your tunnel can't route. The apps fall back to IPv4 automatically and work fine. Ignore those errors unless Safari or specific apps are actually broken.
+
+### Battery drain on iPhone with SFI
+
+The chained encryption uses slightly more CPU than plain VPN. Not a huge difference but noticeable on older devices. Mitigations:
+
+- Turn it off when you don't need it
+- Only enable "Include All Networks" if you actually need always-on
+- Pick a camouflage target geographically close to your VPS — fewer long-latency retries
+
+## Desktop client issues
+
+### "Address already in use" when starting xray
+
+Something else is bound to port 10808 or 10809 on your local machine. Check:
+
+```bash
+lsof -i :10808
+lsof -i :10809
+```
+
+Kill whatever's using it, or edit `xray-client.json` to use different ports.
+
+### "GhostGuard already running" or similar stale PID
+
+If you have an older PID file from a previous version or interrupted run:
+
+```bash
+rm -f ~/.swizguard-*.pid ~/.ghostguard-*.pid
+sudo pkill xray
+```
+
+Then start fresh.
+
+### Can reach VPS via SSH but the proxy times out
+
+Xray isn't completing the REALITY handshake. Test the camouflage directly from your client machine:
+
+```bash
+curl -v --resolve www.microsoft.com:443:YOUR_VPS_IP https://www.microsoft.com
+```
+
+If THAT returns Microsoft's real page, the REALITY camouflage is working server-side. The issue is on your client.
+
+Check the client's `xray-client.json`:
+- Correct `address` (your VPS IP)
+- Correct `port` (443)
+- Correct `uuid` (matches server)
+- Correct `publicKey` (matches server REALITY public key)
+- Correct `shortId`
+- Correct `serverName` (matches server camouflage target — both should be `www.microsoft.com` if using default)
+- `flow: "xtls-rprx-vision"`
+
+If any are wrong, regen on the server:
+```bash
+sudo ./swizguard regen <client-name>
+```
+
+### Some apps work through the tunnel, others don't
+
+Apps that don't honor system proxy settings bypass SwizGuard. Options:
+
+1. **Configure the app directly** to use SOCKS5 `127.0.0.1:10808`
+2. **Use a transparent proxy layer** for full OS-level coverage on macOS — Clash Verge or sing-box with TUN mode pointing at SwizGuard's SOCKS proxy. More setup but catches everything.
+3. **On iPhone**, SFI uses a TUN interface which catches all traffic automatically. No per-app config needed.
+
+### macOS `curl ifconfig.me` shows real IP even with system proxy enabled
+
+This is a curl thing, not a SwizGuard problem. macOS curl isn't built with native proxy support reading from System Preferences. Verify with Safari instead — that DOES respect system proxy settings. If Safari shows your VPS IP, system proxy is working; curl just ignores it.
+
+To make curl respect the proxy, either:
+
+```bash
+curl --socks5 127.0.0.1:10808 ifconfig.me
+```
+
+Or set environment variables:
+
+```bash
+export ALL_PROXY=socks5://127.0.0.1:10808
+curl ifconfig.me
+```
+
+## Performance issues
+
+### Speeds significantly lower than raw WireGuard
+
+Expected throughput is ~70-80% of raw WireGuard. If you're seeing dramatically less:
+
+**MTU fragmentation:** try lowering the MTU in the client config. SwizGuard defaults to 1280. If you're on a network with unusually low MTU (some mobile carriers), try 1200.
+
+**CPU bottleneck on the server:** a $5 VPS usually handles 2-3 active users at line-rate. If you're maxing CPU, upgrade the plan or reduce concurrent clients.
+
+**Geography:** traffic goes client → VPS → destination → VPS → client. A VPS far from both you AND your destinations adds round-trip latency.
+
+**Old Xray version:** use v25.x or newer. Older versions don't have the kernel splice optimization that Vision enables.
+
+### High latency / ping spikes
+
+REALITY handshake adds ~1-5ms baseline. If you see way more than that:
+
+- Wrong camouflage target — switch from `www.microsoft.com` to something with edges closer to you (`www.cloudflare.com` has edges everywhere)
+- VPS too far away geographically — pick a provider with locations near you
+- gVisor overhead in userspace WG — on Linux clients with root, you can set `noKernelTun: false` in the Xray config to use kernel TUN for WG instead. Slightly faster.
+
+## DNS issues
+
+### ISP DNS showing up on leak tests
+
+You probably have DNS set to your ISP, or you're using browser-level DoH that bypasses the tunnel.
+
+Check the client DNS config:
+- SwizGuard sing-box configs use `1.1.1.1` via the tunnel by default
+- SwizGuard Xray clients don't set DNS explicitly — apps use system DNS
+
+On macOS, force DNS through the proxy when system proxy is enabled:
+```bash
+sudo networksetup -setdnsservers Wi-Fi 1.1.1.1 8.8.8.8
+```
+
+**Important context:** Google or Cloudflare DNS showing up is NORMAL — that's what you configured. A LEAK is when your ISP's DNS (Comcast, Verizon, etc.) appears. If you only see Google or Cloudflare, that's correct behavior — those queries are going through the tunnel, just resolving via a public resolver.
+
+### Browser DoH bypassing the tunnel
+
+Firefox and Chrome can do DNS-over-HTTPS directly to Cloudflare, bypassing your tunnel's DNS config. The DNS queries are still encrypted (good for privacy), but they're not going through your VPS (a leak from a threat-model perspective).
+
+Fix: in browser settings, disable DNS-over-HTTPS. Or accept it — DoH queries are still encrypted, just reaching Cloudflare directly.
+
+## Server issues
+
+### Xray won't start on the server
+
+```bash
+sudo journalctl -u xray -n 50 --no-pager
+```
+
+Common causes:
+
+**Port 443 already in use:**
+```bash
+sudo ss -tlnp | grep 443
+```
+Kill whatever else is on 443 (nginx, caddy) or move Xray to a different port (edit `/usr/local/etc/xray/config.json`).
+
+**Bad config:**
+```bash
+/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
+```
+Tells you exactly what's wrong in the JSON.
+
+**Empty REALITY private key:** happens if `xray x25519` output parsing failed during setup. Regenerate manually:
+```bash
+/usr/local/bin/xray x25519
+# Copy the PrivateKey value into /usr/local/etc/xray/config.json
+sudo systemctl restart xray
+```
+
+### WireGuard won't start on the server
+
+```bash
+sudo journalctl -u wg-quick@wg1 -n 50 --no-pager
+```
+
+Common causes:
+- Kernel module not loaded: `sudo modprobe wireguard`
+- Config syntax error: `sudo wg-quick strip wg1`
+- Port 51821 conflict (unlikely — it's localhost-only in SwizGuard)
+
+### Two peers showing same AllowedIPs / one peer showing `(none)`
+
+Hit this myself during a regen cycle. The bug was in older add-client.sh where peer IP assignment counted existing peer blocks instead of finding the highest IP in use. After a remove + re-add, the new peer collided with an existing one.
+
+The current SwizGuard scripts use the "find highest IP and increment" method which avoids this. But if you have a corrupted wg1.conf from before the fix, manually edit it:
+
+```bash
+sudo cat /etc/wireguard/wg1.conf
+# Look for [Peer] blocks with duplicate AllowedIPs
+sudo wg-quick down wg1
+sudo nano /etc/wireguard/wg1.conf
+# Fix the duplicates by giving each peer a unique IP
+sudo wg-quick up wg1
+sudo wg show wg1
+```
+
+Then regen the affected client and redeploy.
+
+### Services not running after VPS reboot
+
+Both should auto-start. If they don't:
+
+```bash
+sudo systemctl enable --now xray
+sudo systemctl enable --now wg-quick@wg1
+```
+
+### Xray access logs are recording domain names
+
+This shouldn't happen — SwizGuard's default config disables access logging. But if you upgraded from an older version or manually edited the config, check:
+
+```bash
+grep -A2 '"log"' /usr/local/etc/xray/config.json
+```
+
+Should have:
+```json
+"log": {
+    "access": "none",
+    "loglevel": "warning"
+}
+```
+
+If `"access": "none"` is missing, add it and restart Xray:
+
+```bash
+sudo sed -i 's|"loglevel": "warning"|"access": "none",\n        "loglevel": "warning"|' /usr/local/etc/xray/config.json
+sudo systemctl restart xray
+```
+
+Also vacuum any existing logs that captured domain history:
+
+```bash
+sudo journalctl --rotate
+sudo journalctl --vacuum-time=1s
+```
+
+## Camouflage issues
+
+### "REALITY: Choosing apple, icloud, etc. as the target may get your IP blocked by the GFW"
+
+This warning comes from Xray itself when your camouflage target is Apple/iCloud. Apple domains have been occasionally flagged in DPI systems — that's why SwizGuard's default is `www.microsoft.com`.
+
+If you're seeing this warning, your server config still has `www.apple.com`:
+
+```bash
+sudo sed -i 's|www.apple.com|www.microsoft.com|g' /usr/local/etc/xray/config.json
+sudo systemctl restart xray
+```
+
+Then regen all clients so their `serverName` matches:
+
+```bash
+sudo ./swizguard regen <each-client-name>
+```
+
+### Camouflage target rate-limits your VPS
+
+If your server's IP gets flagged by Microsoft (or whatever target) and starts getting rate-limited, active REALITY probes may fail. Your clients still work — they authenticate before triggering the real-site proxy path — but probers might see rate-limit responses instead of the real site, which could be suspicious to a sophisticated adversary.
+
+Switch to a different target:
+- `www.cloudflare.com`
+- `www.bing.com`
+- `www.github.com`
+- `www.amazon.com`
+
+## Security questions
+
+### Can my VPS provider see my traffic?
+
+They can see encrypted TLS 1.3 traffic leaving their infrastructure, but not what's inside it. Same trust model as any VPN — your VPS provider is the one piece of infrastructure you have to trust.
+
+To minimize:
+- Pick a provider in a jurisdiction you trust
+- Pay with Monero for anonymity
+- Rotate REALITY keys periodically
+- Don't reuse the VPS for other public services
+
+### Should I rotate keys?
+
+Good practice every 3-6 months:
+
+```bash
+sudo ./swizguard rekey
+```
+
+Then regen and redeploy all client configs. This is destructive — old clients stop working.
+
+Rotate immediately if you suspect:
+- Someone gained access to your VPS
+- A client device was compromised or lost
+- A credential leaked in a screenshot, log, or shared config
+
+### Are there logs anywhere?
+
+Xray access logs: disabled by default in SwizGuard.
+
+Xray warnings/errors: go to systemd journal (`journalctl -u xray`). These don't include destination info, just operational errors.
+
+WireGuard: kernel-level, doesn't log individual connections.
+
+System logs (`/var/log/syslog`, `auth.log`): normal Linux logging. Won't have destination info from SwizGuard traffic.
+
+If you want to be paranoid, set up aggressive log rotation with shredding:
+
+```bash
+sudo nano /etc/logrotate.d/swizguard-paranoid
+```
+
+```
+/var/log/syslog /var/log/auth.log {
+    daily
+    rotate 3
+    compress
+    shred
+    shredcycles 3
+}
+```
+
+## When things go wrong and you need help
+
+Before opening an issue or asking, gather:
+
+1. Your SwizGuard version / git commit
+2. OS and version (`lsb_release -a` on Linux)
+3. Xray version (`xray version`)
+4. sing-box version (from SFI's about screen)
+5. The exact error message
+6. Output of `sudo ./swizguard status`
+7. Recent Xray logs: `sudo journalctl -u xray -n 50`
+8. Recent WG status: `sudo wg show wg1`
+
+Never share:
+- REALITY private key
+- WireGuard private keys (server or client)
+- Client UUIDs
+- The actual config files (unless sanitized first)
+- Your VPS IP if you don't want it correlated to you

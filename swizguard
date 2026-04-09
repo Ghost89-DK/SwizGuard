@@ -1,0 +1,396 @@
+#!/bin/bash
+#
+# swizguard — master wrapper script
+# Single entry point for server setup, client generation, and management.
+#
+# Usage:
+#   ./swizguard setup                 # fresh server install
+#   ./swizguard add <client-name>     # generate client package + QR code
+#   ./swizguard regen <client-name>   # regenerate configs for existing client
+#   ./swizguard share <client-name>   # print QR + VLESS link for existing client
+#   ./swizguard list                  # list all clients
+#   ./swizguard remove <client-name>  # delete client + revoke access
+#   ./swizguard status                # server health + connected peers
+#   ./swizguard upgrade-vision        # enable xtls-rprx-vision on existing deployment
+#   ./swizguard rekey                 # rotate REALITY keys (⚠ invalidates all clients)
+#   ./swizguard nuke                  # ☢ full uninstall — wipes everything
+#   ./swizguard help
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SWIZ_DIR="/etc/swizguard"
+
+R='\033[91m' G='\033[92m' Y='\033[93m' C='\033[96m' B='\033[1m' X='\033[0m'
+
+info()  { echo -e "  ${C}[*]${X} $1"; }
+ok()    { echo -e "  ${G}[+]${X} $1"; }
+warn()  { echo -e "  ${Y}[!]${X} $1"; }
+fail()  { echo -e "  ${R}[✗]${X} $1"; exit 1; }
+
+banner() {
+    echo -e "${C}${B}"
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║                 SwizGuard                            ║"
+    echo "║     WireGuard + VLESS + REALITY = invisible VPN      ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo -e "${X}"
+}
+
+# ─── Commands ─────────────────────────────────────────────────────
+
+cmd_setup() {
+    banner
+    [ "$EUID" -ne 0 ] && fail "Run with sudo"
+    [ -d "$SWIZ_DIR" ] && warn "SwizGuard appears to already be installed at $SWIZ_DIR" && \
+        read -p "  Continue and overwrite? (y/N): " yn && \
+        [[ ! "$yn" =~ ^[Yy]$ ]] && exit 0
+    bash "$SCRIPT_DIR/scripts/setup-server.sh"
+    echo ""
+    ok "Setup complete. Generate your first client with:"
+    echo -e "     ${B}./swizguard add macbook${X}"
+}
+
+cmd_add() {
+    [ "$EUID" -ne 0 ] && fail "Run with sudo"
+    [ $# -lt 1 ] && fail "Usage: ./swizguard add <client-name>"
+    local name="$1"
+    bash "$SCRIPT_DIR/scripts/add-client.sh" "$name"
+    echo ""
+    cmd_share "$name"
+}
+
+cmd_share() {
+    [ $# -lt 1 ] && fail "Usage: ./swizguard share <client-name>"
+    local name="$1"
+    local cdir="$SWIZ_DIR/clients/$name"
+    [ ! -d "$cdir" ] && fail "Client '$name' not found"
+    [ ! -f "$SWIZ_DIR/credentials.env" ] && fail "Server not set up"
+
+    source "$SWIZ_DIR/credentials.env"
+
+    local vless_url="vless://${CLIENT_UUID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&security=reality&sni=${CAMOUFLAGE_DEST}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#SwizGuard-${name}"
+
+    echo ""
+    echo -e "  ${B}Deployment options for '$name':${X}"
+    echo ""
+    echo -e "  ${B}1. Desktop (full chain — Xray with chained WG + VLESS+REALITY+Vision)${X}"
+    echo "     On the client machine:"
+    echo ""
+    echo "       # If you have an existing copy, remove it first"
+    echo "       rm -rf ~/Downloads/swizguard-$name"
+    echo ""
+    echo "       # On THIS server, make private.key readable by non-root scp:"
+    echo "       sudo chmod 644 $cdir/private.key"
+    echo ""
+    echo "       # From the client, scp the folder:"
+    echo "       scp -P 13337 -i YOUR_KEY USER@${SERVER_IP}:${cdir} \\"
+    echo "           ~/Downloads/swizguard-$name"
+    echo ""
+    echo "       # Start the tunnel (no sudo needed)"
+    echo "       cd ~/Downloads/swizguard-$name && bash connect-${name}.sh"
+    echo ""
+    echo "       # Verify"
+    echo "       curl --socks5 127.0.0.1:10808 -4 ifconfig.me"
+    echo "       # should return ${SERVER_IP}"
+    echo ""
+    echo -e "  ${B}2. iPhone (full chain — sing-box via SFI)${X}"
+    echo "     a. Install SFI (Sing-Box For iOS) from the App Store"
+    echo "     b. Transfer singbox-client.json to the iPhone"
+    echo "        (scp to Mac → AirDrop to iPhone → save to Files)"
+    echo "     c. In SFI: Profiles → + → Local → pick the JSON"
+    echo "     d. Dashboard → select profile → Start → Allow VPN"
+    echo ""
+    echo -e "  ${B}3. Android (full chain — sing-box via SFA, or Xray via v2rayNG)${X}"
+    echo "     Transfer xray-client.json or singbox-client.json to the phone"
+    echo "     Import into the app, activate"
+    echo ""
+    echo -e "  ${B}4. Fallback — VLESS+REALITY only (NO inner WireGuard layer)${X}"
+    echo "     For clients that can't import raw JSON (Hiddify, Shadowrocket)."
+    echo "     Scan this QR or paste the share URL below:"
+    echo ""
+    if command -v qrencode &> /dev/null; then
+        echo "$vless_url" | qrencode -t ansiutf8
+    else
+        warn "     qrencode not installed — install with: apt install -y qrencode"
+    fi
+    echo ""
+    echo "     $vless_url"
+    echo ""
+    warn "Options 1, 2, and 3 give the full chain (WG + VLESS+REALITY+Vision)"
+    warn "Option 4 is VLESS+REALITY+Vision only — still camouflaged, but no WG layer"
+    echo ""
+}
+
+cmd_list() {
+    [ ! -d "$SWIZ_DIR/clients" ] && info "No clients yet. Add one with: ./swizguard add <name>" && return
+    echo ""
+    echo -e "  ${B}Clients:${X}"
+    for c in "$SWIZ_DIR/clients"/*/; do
+        [ -d "$c" ] || continue
+        local name=$(basename "$c")
+        echo "    - $name"
+    done
+    echo ""
+}
+
+cmd_remove() {
+    [ "$EUID" -ne 0 ] && fail "Run with sudo"
+    [ $# -lt 1 ] && fail "Usage: ./swizguard remove <client-name>"
+    local name="$1"
+    local cdir="$SWIZ_DIR/clients/$name"
+    [ ! -d "$cdir" ] && fail "Client '$name' not found"
+
+    local pubkey
+    pubkey=$(cat "$cdir/public.key")
+
+    warn "Removing client '$name' (public key: ${pubkey:0:20}...)"
+    read -p "  Confirm? (y/N): " yn
+    [[ ! "$yn" =~ ^[Yy]$ ]] && echo "Aborted" && exit 0
+
+    # Remove from running WireGuard
+    wg set wg1 peer "$pubkey" remove 2>/dev/null || true
+
+    # Remove from wg1.conf (delete the [Peer] block with this pubkey)
+    python3 - "$pubkey" <<'PYEOF'
+import sys, re
+pubkey = sys.argv[1]
+with open('/etc/wireguard/wg1.conf', 'r') as f:
+    content = f.read()
+# Split into sections, drop the [Peer] block containing pubkey
+blocks = re.split(r'(?m)^\[Peer\]$', content)
+header = blocks[0]
+peers = blocks[1:]
+kept = [p for p in peers if pubkey not in p]
+new = header + ''.join('[Peer]' + p for p in kept)
+with open('/etc/wireguard/wg1.conf', 'w') as f:
+    f.write(new)
+PYEOF
+
+    rm -rf "$cdir"
+    ok "Client '$name' removed"
+}
+
+cmd_status() {
+    bash "$SCRIPT_DIR/scripts/status.sh"
+}
+
+cmd_rekey() {
+    [ "$EUID" -ne 0 ] && fail "Run with sudo"
+    warn "⚠ This will rotate the REALITY x25519 keypair."
+    warn "⚠ ALL existing client configs will stop working until regenerated."
+    read -p "  Type 'rekey' to confirm: " yn
+    [ "$yn" != "rekey" ] && echo "Aborted" && exit 0
+
+    info "Generating new REALITY keys..."
+    local xray_keys
+    xray_keys=$(/usr/local/bin/xray x25519)
+    local new_priv
+    new_priv=$(echo "$xray_keys" | grep "^PrivateKey:" | awk '{print $2}')
+    local new_pub
+    new_pub=$(echo "$xray_keys" | grep -E "^(Password|PublicKey)" | awk '{print $NF}')
+
+    [ -z "$new_priv" ] && fail "Failed to parse new private key"
+    [ -z "$new_pub" ] && fail "Failed to parse new public key"
+
+    # Update server Xray config
+    sed -i "s|\"privateKey\": \".*\"|\"privateKey\": \"$new_priv\"|" /usr/local/etc/xray/config.json
+    # Update credentials file
+    sed -i "s|^REALITY_PRIVATE_KEY=.*|REALITY_PRIVATE_KEY=$new_priv|" "$SWIZ_DIR/credentials.env"
+    sed -i "s|^REALITY_PUBLIC_KEY=.*|REALITY_PUBLIC_KEY=$new_pub|" "$SWIZ_DIR/credentials.env"
+
+    systemctl restart xray
+    ok "REALITY keys rotated"
+    ok "New public key: $new_pub"
+    warn "Regenerate all client configs with: ./swizguard add <name>"
+}
+
+cmd_upgrade_vision() {
+    [ "$EUID" -ne 0 ] && fail "Run with sudo"
+    warn "⚠ This will enable xtls-rprx-vision flow on the server."
+    warn "⚠ ALL existing client configs will need to be regenerated."
+    warn "⚠ Old clients (without vision flow) will STOP WORKING."
+    echo ""
+    info "Benefits of Vision flow:"
+    echo "    - Closes TLS-in-TLS fingerprinting (known GFW detection)"
+    echo "    - Better performance via kernel splice"
+    echo "    - Universally recommended for VLESS+REALITY"
+    echo ""
+    read -p "  Type 'upgrade' to confirm: " yn
+    [ "$yn" != "upgrade" ] && echo "Aborted" && exit 0
+
+    info "Enabling xtls-rprx-vision on server inbound..."
+    # Update the flow in the server config (only the first occurrence)
+    sed -i '0,/"flow": ""/s||"flow": "xtls-rprx-vision"|' /usr/local/etc/xray/config.json
+    systemctl restart xray
+    ok "Server running with Vision flow"
+    echo ""
+    warn "Now regenerate ALL client configs:"
+    for c in "$SWIZ_DIR/clients"/*/; do
+        [ -d "$c" ] || continue
+        local name=$(basename "$c")
+        echo "    sudo ./swizguard regen $name"
+    done
+    echo ""
+}
+
+cmd_regen() {
+    [ "$EUID" -ne 0 ] && fail "Run with sudo"
+    [ $# -lt 1 ] && fail "Usage: ./swizguard regen <client-name>"
+    local name="$1"
+    local cdir="$SWIZ_DIR/clients/$name"
+    [ ! -d "$cdir" ] && fail "Client '$name' not found"
+    [ ! -f "$SWIZ_DIR/credentials.env" ] && fail "Server not set up"
+
+    source "$SWIZ_DIR/credentials.env"
+
+    # Reuse the existing WireGuard keys from the client dir
+    local client_wg_privkey
+    client_wg_privkey=$(cat "$cdir/private.key")
+    local client_wg_pubkey
+    client_wg_pubkey=$(cat "$cdir/public.key")
+
+    # Determine this client's IP from wg1.conf
+    local peer_line
+    peer_line=$(grep -A2 "^# $name$" /etc/wireguard/wg1.conf | grep AllowedIPs || true)
+    [ -z "$peer_line" ] && fail "Could not find AllowedIPs for client '$name' in wg1.conf"
+    local client_ipv4
+    client_ipv4=$(echo "$peer_line" | grep -oE '10\.7\.0\.[0-9]+')
+    local client_ipv6
+    client_ipv6=$(echo "$peer_line" | grep -oE 'fd07::7[0-9]+' || echo "fd07::72")
+
+    info "Regenerating configs for '$name' ($client_ipv4 / $client_ipv6)..."
+
+    # Regenerate both Xray and sing-box configs with current server settings
+    CLIENT_NAME="$name" \
+    CLIENT_IPV4="$client_ipv4" \
+    CLIENT_IPV6="$client_ipv6" \
+    CLIENT_WG_PRIVKEY="$client_wg_privkey" \
+    CLIENT_WG_PUBKEY="$client_wg_pubkey" \
+    CLIENT_DIR="$cdir" \
+    SERVER_IP="$SERVER_IP" \
+    XRAY_PORT="$XRAY_PORT" \
+    WG_PORT="$WG_PORT" \
+    CLIENT_UUID="$CLIENT_UUID" \
+    CAMOUFLAGE_DEST="$CAMOUFLAGE_DEST" \
+    REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" \
+    SERVER_WG_PUBLIC_KEY="$SERVER_WG_PUBLIC_KEY" \
+    SHORT_ID="$SHORT_ID" \
+    bash "$SCRIPT_DIR/scripts/regen-client-configs.sh"
+
+    ok "Configs regenerated for '$name'"
+    echo "    $cdir/xray-client.json       (desktop — Xray)"
+    echo "    $cdir/singbox-client.json    (mobile — sing-box / SFI / SFA)"
+    echo ""
+    echo -e "  ${B}How to deploy:${X}"
+    echo ""
+    echo -e "  ${B}Desktop (macOS / Linux / Windows):${X}"
+    echo "    1. On the client machine, stop any existing tunnel first:"
+    echo "         bash ~/path/to/$name/connect-$name.sh stop"
+    echo ""
+    echo "    2. Remove the stale local copy to avoid nested scp directories:"
+    echo "         rm -rf ~/Downloads/swizguard-$name"
+    echo ""
+    echo "    3. Make private.key readable to your SSH user (if perm denied):"
+    echo "         # on THIS server"
+    echo "         sudo chmod 644 $cdir/private.key"
+    echo ""
+    echo "    4. SCP the client folder down:"
+    echo "         scp -P 13337 -i YOUR_KEY USER@$SERVER_IP:$cdir \\"
+    echo "             ~/Downloads/swizguard-$name"
+    echo ""
+    echo "    5. Start the tunnel:"
+    echo "         cd ~/Downloads/swizguard-$name && bash connect-$name.sh"
+    echo ""
+    echo "    6. Verify:"
+    echo "         curl --socks5 127.0.0.1:10808 -4 --max-time 10 ifconfig.me"
+    echo "         # should return $SERVER_IP"
+    echo ""
+    echo -e "  ${B}iPhone (SFI):${X}"
+    echo "    1. Get singbox-client.json onto the iPhone"
+    echo "       (SCP to Mac, then AirDrop / iCloud Drive / iMessage)"
+    echo "    2. In SFI: Profiles tab → delete the old profile for '$name'"
+    echo "    3. Profiles → + → Local → pick the new singbox-client.json"
+    echo "    4. Dashboard → select the new profile → Start"
+    echo ""
+    echo -e "  ${B}Android (SFA / v2rayNG):${X}"
+    echo "    1. Get the JSON onto the phone"
+    echo "    2. Delete the old profile in the app"
+    echo "    3. Import the fresh config"
+    echo "    4. Activate"
+    echo ""
+    warn "If the old profile is still running on a device, the new one will"
+    warn "fail to connect due to key/config mismatch. Always delete the old"
+    warn "profile before importing the regenerated one."
+    echo ""
+}
+
+cmd_nuke() {
+    [ "$EUID" -ne 0 ] && fail "Run with sudo"
+    warn "☢ This will COMPLETELY REMOVE SwizGuard:"
+    echo "    - All client configs"
+    echo "    - REALITY + WireGuard keys"
+    echo "    - Xray server config and systemd service"
+    echo "    - wg1 WireGuard interface and config"
+    echo "    - Credentials file"
+    echo ""
+    read -p "  Type 'NUKE' to confirm: " yn
+    [ "$yn" != "NUKE" ] && echo "Aborted" && exit 0
+
+    info "Stopping services..."
+    systemctl stop xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    wg-quick down wg1 2>/dev/null || true
+    systemctl disable wg-quick@wg1 2>/dev/null || true
+
+    info "Removing files..."
+    rm -f /etc/systemd/system/xray.service
+    rm -f /usr/local/etc/xray/config.json
+    rm -f /etc/wireguard/wg1.conf
+    rm -rf "$SWIZ_DIR"
+    rm -f /usr/local/bin/xray
+
+    systemctl daemon-reload
+    ok "SwizGuard fully removed. You can run './swizguard setup' again to reinstall."
+}
+
+cmd_help() {
+    banner
+    cat <<'HELP'
+  Usage:
+    ./swizguard setup                  Install server (fresh VPS)
+    ./swizguard add <name>             Generate client package + QR code
+    ./swizguard regen <name>           Regenerate configs for existing client
+    ./swizguard share <name>           Show QR + VLESS link for existing client
+    ./swizguard list                   List all clients
+    ./swizguard remove <name>          Delete client and revoke access
+    ./swizguard status                 Show server health
+    ./swizguard upgrade-vision         Enable xtls-rprx-vision flow (⚠ breaks old clients)
+    ./swizguard rekey                  Rotate REALITY keys (invalidates clients)
+    ./swizguard nuke                   ☢ Full uninstall
+    ./swizguard help                   Show this message
+
+  Most commands need sudo (server-side actions).
+
+  First time? Start with:
+    sudo ./swizguard setup
+    sudo ./swizguard add macbook
+HELP
+}
+
+# ─── Dispatch ─────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    setup)           shift; cmd_setup "$@" ;;
+    add)             shift; cmd_add "$@" ;;
+    regen)           shift; cmd_regen "$@" ;;
+    share)           shift; cmd_share "$@" ;;
+    list)            shift; cmd_list "$@" ;;
+    remove)          shift; cmd_remove "$@" ;;
+    status)          shift; cmd_status "$@" ;;
+    upgrade-vision)  shift; cmd_upgrade_vision "$@" ;;
+    rekey)           shift; cmd_rekey "$@" ;;
+    nuke)            shift; cmd_nuke "$@" ;;
+    help|-h|--help)  cmd_help ;;
+    *)               fail "Unknown command: $1. Run './swizguard help'" ;;
+esac

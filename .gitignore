@@ -1,0 +1,25 @@
+# Test artifacts
+/tmp-test/
+/test-output/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Never commit actual credentials or client secrets
+credentials.env
+*.key
+clients/
+!clients/.gitkeep
+
+# Runtime state
+*.pid
+*.log
+xray.log
+
+# Macros
+.idea/

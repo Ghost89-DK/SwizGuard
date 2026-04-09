@@ -1,0 +1,92 @@
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "inbounds": [
+        {
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": 10808,
+            "protocol": "socks",
+            "settings": {
+                "udp": true,
+                "auth": "noauth"
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls"]
+            }
+        },
+        {
+            "tag": "http-in",
+            "listen": "127.0.0.1",
+            "port": 10809,
+            "protocol": "http"
+        }
+    ],
+    "outbounds": [
+        {
+            "tag": "wireguard-out",
+            "protocol": "wireguard",
+            "settings": {
+                "secretKey": "CLIENT-WG-PRIVATE-KEY",
+                "address": ["10.7.0.3/32"],
+                "peers": [
+                    {
+                        "publicKey": "SERVER-WG-PUBLIC-KEY",
+                        "endpoint": "127.0.0.1:51820",
+                        "allowedIPs": ["0.0.0.0/0", "::/0"],
+                        "keepAlive": 25
+                    }
+                ],
+                "mtu": 1280,
+                "noKernelTun": true
+            },
+            "streamSettings": {
+                "sockopt": {
+                    "dialerProxy": "proxy"
+                }
+            }
+        },
+        {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+                "vnext": [
+                    {
+                        "address": "YOUR-SERVER-IP",
+                        "port": 443,
+                        "users": [
+                            {
+                                "id": "YOUR-UUID-HERE",
+                                "encryption": "none",
+                                "flow": ""
+                            }
+                        ]
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show": false,
+                    "fingerprint": "chrome",
+                    "serverName": "www.microsoft.com",
+                    "publicKey": "YOUR-REALITY-PUBLIC-KEY",
+                    "shortId": "YOUR-SHORT-ID",
+                    "spiderX": ""
+                }
+            }
+        }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "type": "field",
+                "inboundTag": ["socks-in", "http-in"],
+                "outboundTag": "wireguard-out"
+            }
+        ]
+    }
+}
