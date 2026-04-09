@@ -42,6 +42,37 @@ your device → Xray/sing-box (WireGuard → VLESS → REALITY → Vision) → y
 
 Three layers of encryption. Zero signal that a VPN exists. No third party in the trust chain except your own VPS provider.
 
+## What this looks like on the wire
+
+This is the part that matters. Here's what an observer (your ISP, a corporate firewall, a censoring government) actually sees in Wireshark.
+
+### Plain WireGuard
+
+![Raw WireGuard in Wireshark](docs/images/raw-wireguard-wireshark.png)
+
+Every packet is labeled `WireGuard`. Wireshark identifies the protocol immediately because the handshake pattern is unique and the transport headers are distinctive. Any DPI system, any modern firewall, any network operator with basic tooling can flag these packets in milliseconds. They don't need to decrypt anything — the protocol identification IS the fingerprint.
+
+The "Info" column even shows packet types: `Transport Data, receiver=0x..., counter=...`. That's WireGuard's internal session structure leaking out. To a censor, this is a screaming neon sign that says "VPN here, please block me."
+
+### SwizGuard
+
+![SwizGuard traffic in Wireshark](docs/images/swizguard-wireshark-tls.png)
+
+Every packet is labeled `TLSv1.2` or `TCP`, port 443, "Application Data". This is what HTTPS to any normal website looks like in Wireshark. Same shape as Safari loading microsoft.com, or Mail checking iCloud, or your phone updating an app.
+
+There is no `WireGuard` label anywhere because WireGuard is happening **inside** the encrypted TLS session. Wireshark doesn't know it's there. DPI doesn't know it's there. Your ISP doesn't know it's there. The fingerprint that gives away plain WireGuard isn't visible because it's wrapped inside REALITY's outer TLS layer, and Vision flow pads the inner handshake to defeat the TLS-in-TLS detection technique that catches naive nested TLS proxies.
+
+### Why this matters
+
+In a normal day on a normal home network in the US, the difference between these two captures is mostly philosophical — your ISP isn't actively blocking VPNs, so plain WireGuard works fine. But the moment you step outside that environment, the difference becomes the difference between "I have internet" and "I don't."
+
+- **Hotel and airport Wi-Fi.** Many of them block known VPN protocols to enforce captive portal terms or to throttle "non-business" traffic. Plain WireGuard gets dropped. SwizGuard goes straight through because it's just HTTPS.
+- **Corporate networks.** Most enterprise firewalls are configured to identify and block VPNs by default. Plain WireGuard fails. SwizGuard looks like browsing microsoft.com — and ironically, in a Microsoft 365 environment, that traffic pattern is so common it's invisible.
+- **State censorship.** China's GFW, Russia's TSPU, Iran's filtering — all use deep packet inspection that fingerprints VPN protocols. Plain WireGuard is dead the moment you cross the border. SwizGuard works because nothing in the wire format gives away the VPN.
+- **Surveillance environments.** Even when you're not blocked, the simple fact that "Jake is using a VPN" is metadata. Your ISP can sell that, log it, hand it over with a subpoena, or use it as a flag in an automated system. With SwizGuard, that metadata doesn't exist — there's nothing to tell your ISP that anything unusual is happening.
+
+The Wireshark difference is the entire reason SwizGuard exists. Plain WireGuard says "I am a VPN, please make decisions based on that." SwizGuard says "I am someone reading microsoft.com, please ignore me."
+
 ## How it holds up
 
 I tested this in real conditions. My own daily use on a VPS I rent from a cheap provider, running on my Mac with system proxy enabled and my iPhone using sing-box via SFI. Here's what I can verify:
